@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """noise (6426/tcp) — flag farm module. Four independent chains.
 
-Audit: /home/kali/adctf/cubectf/audit/noise.md
-Source: /home/kali/adctf/cubectf/services/services/noise
 
 The secrets live in two SQLite TEXT columns: `dm.message` (private DMs) and
 `gmsg.message` (private group posts). There is no flag file. Every vector here
