@@ -1,2 +1,4 @@
 *.log
 exploit.log
+.noise-invite.json
+__pycache__/
