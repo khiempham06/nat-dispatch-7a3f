@@ -65,8 +65,22 @@ def age(exploit):
 
 def restart(exploit, service):
     name = os.path.basename(exploit)
-    subprocess.run(["glitch", "exploit", "kill", name], capture_output=True, text=True)
-    time.sleep(2)
+    # Do NOT use `glitch exploit kill <name>.py`: it is a no-op. glitch's
+    # dispatcher returns on `len(sys.argv) < 5` before reaching the kill
+    # branch, even though its own help documents that exact 4-argument form.
+    # Trusting it leaked one extra thrower on EVERY restart here and helped
+    # drive the box to a 15-minute load average of 202, which took our own
+    # flightplan, doors and shaas SLA checks down. So pkill directly, and
+    # refuse to start a replacement until the old process is really gone.
+    subprocess.run(["pkill", "-f", "thrower .*/%s" % name],
+                   capture_output=True, text=True)
+    for _ in range(10):
+        time.sleep(1)
+        if not running(exploit):
+            break
+    else:
+        log("REFUSING to restart %s: the old process will not die" % name)
+        return False
     r = subprocess.run(["glitch", "exploit", "throw", exploit, service],
                        capture_output=True, text=True)
     ok = "started" in (r.stdout or "")
