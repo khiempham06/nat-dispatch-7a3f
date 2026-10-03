@@ -30,7 +30,15 @@ THROWERS = [
 POLL = 60               # seconds between checks
 STALE = 8 * 60          # a log quiet this long means the throw thread is dead
 GRACE = 3 * 60          # after a restart, give it this long before judging again
-MOST_STALE_OK = 0.75    # if more than this fraction look dead, suspect the gameserver
+
+#: Per-thrower restart budget, instead of a global "most look dead -> back off".
+#: The global version misfired: it counted a deliberately-stopped thrower and a
+#: broken-but-alive one toward "the gameserver is down", decided the whole game
+#: was offline and stopped supervising ANYTHING, so a genuinely recoverable
+#: thrower stayed dead. A per-thrower budget gives up only on the one that keeps
+#: failing and keeps supervising the rest.
+MAX_RESTARTS = 4
+BUDGET_WINDOW = 30 * 60
 
 
 def log(msg):
@@ -69,39 +77,42 @@ def restart(exploit, service):
 
 def main():
     last_restart = {}
-    log("watchdog up: %d throwers, poll=%ds stale=%ds" % (len(THROWERS), POLL, STALE))
+    history = {}            # exploit -> [restart timestamps]
+    log("watchdog up: %d throwers, poll=%ds stale=%ds budget=%d/%dm"
+        % (len(THROWERS), POLL, STALE, MAX_RESTARTS, BUDGET_WINDOW // 60))
     while True:
+        now = time.time()
         verdicts = []
         for exploit, service in THROWERS:
             a = age(exploit)
             alive = running(exploit)
-            recent = time.time() - last_restart.get(exploit, 0) < GRACE
+            recent = now - last_restart.get(exploit, 0) < GRACE
             dead = (not alive) or (a is None) or (a > STALE)
-            verdicts.append((exploit, service, dead, recent, a, alive))
-
-        dead_n = sum(1 for v in verdicts if v[2])          # v[2] is `dead`
-        if dead_n and dead_n >= max(1, int(len(THROWERS) * MOST_STALE_OK)):
-            log("%d/%d look dead -- suspecting the gameserver, backing off"
-                % (dead_n, len(THROWERS)))
-            time.sleep(POLL * 5)
-            continue
+            # drop restarts that have aged out of the rolling window
+            history[exploit] = [t for t in history.get(exploit, [])
+                                if now - t < BUDGET_WINDOW]
+            spent = len(history[exploit])
+            verdicts.append((exploit, service, dead, recent, a, alive, spent))
 
         # ONE restart per cycle, deliberately. Starting several throwers together
         # is what broke them in the first place: each one fetches /api/flagids
         # (144 KB) at startup, the gameserver refuses some of a simultaneous
         # burst, get_flagids() returns {} and the thrower dies on KeyError.
         # Verified by hand: six at once -> 0 survivors, one alone -> survives.
-        for exploit, service, dead, recent, a, alive in verdicts:
-            if not dead:
+        for exploit, service, dead, recent, a, alive, spent in verdicts:
+            if not dead or recent:
                 continue
-            if recent:
-                log("skip %s, restarted recently" % os.path.basename(exploit))
+            name = os.path.basename(exploit)
+            if spent >= MAX_RESTARTS:
+                log("giving up on %s for now (%d restarts in %dm did not stick)"
+                    % (name, spent, BUDGET_WINDOW // 60))
                 continue
             why = "not running" if not alive else (
                 "no log" if a is None else "log quiet %.0fm" % (a / 60))
-            log("%s looks dead (%s)" % (os.path.basename(exploit), why))
+            log("%s looks dead (%s), restart %d/%d" % (name, why, spent + 1, MAX_RESTARTS))
             if restart(exploit, service):
                 last_restart[exploit] = time.time()
+                history[exploit].append(time.time())
             break          # the rest wait for the next cycle
 
         time.sleep(POLL)
