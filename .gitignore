@@ -1,4 +1,10 @@
 *.log
 exploit.log
-.noise-invite.json
-__pycache__/
+# Defensive tooling and patch material must never be published: it documents
+# which of OUR weaknesses are still live. Publish throwers only.
+*_dos_repro.py
+*_repro.py
+*-hardening/
+patch_*.sh
+patches/
+audit/
