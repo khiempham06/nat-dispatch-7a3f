@@ -134,6 +134,17 @@ def tcp_exchange(host: str, port: int, payload: bytes,
 # ----------------------------------------------------------------------- http
 
 
+#: Bypass the box's egress proxy. The vulnbox exports
+#: HTTP_PROXY=http://10.100.0.1:8080 with no_proxy=10.0.0.0/8,..., and urllib
+#: does NOT understand a CIDR entry in no_proxy -- it matches host suffixes --
+#: so every team-to-team request was being sent to the proxy, which answers a
+#: non-JSON 403. curl and requests both implement CIDR matching and go direct,
+#: which is why the identical URL returned 200 by hand while this module saw
+#: 403 on even /health. Every target here is an in-game 10.x address, so an
+#: empty ProxyHandler is the correct, unconditional fix.
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def http(host: str, port: int, path: str, method: str = "GET",
          body: bytes | str | None = None, headers: dict[str, str] | None = None,
          timeout: float = DEFAULT_TIMEOUT, scheme: str = "http") -> tuple[int, dict[str, str], bytes]:
@@ -145,7 +156,7 @@ def http(host: str, port: int, path: str, method: str = "GET",
         request_headers["User-Agent"] = USER_AGENT
     request = urllib.request.Request(url, data=data, method=method, headers=request_headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _DIRECT.open(request, timeout=timeout) as response:
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as error:
         return error.code, dict(error.headers or {}), error.read()
@@ -194,6 +205,10 @@ def candidates(blob: bytes | str) -> list[str]:
         if text not in out:
             out.append(text)
     return out
+
+
+#: This game's exact flag format: 31 of [A-Z0-9] then a literal "=".
+GAME_FLAG_RE = re.compile(r"[A-Z0-9]{31}=")
 
 
 def dedup(values) -> list[str]:
@@ -259,8 +274,14 @@ def main(module_run, default_port: int) -> int:
     if len(sys.argv) > 2 and sys.argv[2]:
         os.environ.setdefault("FARM_FLAGID", sys.argv[2])
     secrets = module_run(host, port)
+    # Recovered secrets are not always bare flags: donor's notes arrive as
+    # "private allocation note: <FLAG>". Emit the flag on its own line when one
+    # is embedded, so submission never depends on how the gameserver happens to
+    # scan stdout, and fall back to the raw value when nothing matches.
     for secret in secrets:
-        print(secret)
+        hits = dedup(GAME_FLAG_RE.findall(secret))
+        for hit in hits or [secret]:
+            print(hit)
     if not secrets:
         print("NO SECRETS RECOVERED (target patched, down, or vector broken)",
               file=sys.stderr)

