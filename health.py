@@ -48,7 +48,17 @@ print("%-20s %7s %7s %6s %6s %6s  %s" %
       ("log", "size", "age", "flags", "uniq", "errs", "state"))
 
 rows = []
-for path in sorted(glob.glob("/root/*.log")):
+#: /root/*.log also catches our own tooling (the tcpdump capture, the
+#: watchdog's log), which are not throwers and were reported as FAIL.
+NOT_THROWERS = {"cap.log", "supervise.log", "health.log", "nohup.log"}
+
+
+def thrower_logs():
+    return [p for p in sorted(glob.glob("/root/*.log"))
+            if os.path.basename(p) not in NOT_THROWERS]
+
+
+for path in thrower_logs():
     name = os.path.basename(path)
     base = name[:-4]
     size = os.path.getsize(path)
@@ -91,7 +101,7 @@ for (name, _svc) in procs:
 print()
 print("=" * 78)
 print("LAST FLAG LINE PER LOG (evidence it is still paying)")
-for path in sorted(glob.glob("/root/*.log")):
+for path in thrower_logs():
     with open(path, "rb") as f:
         size = os.path.getsize(path)
         if size > TAIL:
