@@ -264,7 +264,7 @@ _TARGETS: dict[str, dict] = {}
 
 
 def _target(host: str) -> dict:
-    return _TARGETS.setdefault(
+    state = _TARGETS.setdefault(
         host,
         {
             "fingerprinted": False,
@@ -281,6 +281,15 @@ def _target(host: str) -> dict:
             "dead_pairs": set(),  # (sid, slug) known NOT to reach org-admin
         },
     )
+    # The gameserver's flag id for this service IS the org slug holding the
+    # tick's flag ("org-<hex>"). Campaign enumeration can miss that org
+    # entirely -- CAMPAIGN_WALK_CAP, the per-vector deadline, or simply an org
+    # with no campaign yet -- so seed it as a known victim. Costs nothing when
+    # the walk would have found it anyway, because "orgs" is a dict.
+    hint = os.environ.get("FARM_FLAGID", "")
+    if hint.startswith("org-"):
+        state["orgs"].setdefault(_clean(hint), None)
+    return state
 
 
 def _fingerprint(host, port, timeout) -> bool:

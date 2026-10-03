@@ -253,6 +253,11 @@ def main(module_run, default_port: int) -> int:
         return 2
     host = sys.argv[1]
     port = int(os.environ.get("FARM_PORT", default_port))
+    # Expose the flag id to the vectors without changing run()'s signature. It
+    # is a free target hint: donor's ids are the org slug holding this tick's
+    # flag, which campaign enumeration can miss entirely.
+    if len(sys.argv) > 2 and sys.argv[2]:
+        os.environ.setdefault("FARM_FLAGID", sys.argv[2])
     secrets = module_run(host, port)
     for secret in secrets:
         print(secret)
