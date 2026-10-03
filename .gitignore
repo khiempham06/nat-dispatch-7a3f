@@ -8,3 +8,8 @@ exploit.log
 patch_*.sh
 patches/
 audit/
+# Thrower state: holds the RSA private keys of our bait identities.
+.noise-invite.json
+*.json.tmp
+__pycache__/
+*.pyc
